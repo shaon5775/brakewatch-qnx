@@ -38,6 +38,7 @@
 #include "scenario.h"
 
 #define PRIO_MONITOR 60
+#define PRIO_MAIN    50   /* main must outrank the load threads, or it never gets to start the sensor */
 #define PRIO_SENSOR  40
 #define PRIO_LOAD    10
 #define FRAME_PERIOD_NS   10000000L   /* 100 Hz CAN-like stream */
@@ -120,6 +121,8 @@ static void *monitor_thread(void *arg)
 
     state_t state = ST_OK;
     uint64_t last_frame_ns = now_ns();
+    int have_frame = 0;            /* the watchdog only arms after the first CAN frame */
+    double last_t_s = 0.0;
     rx_msg_t msg;
 
     while (g_running) {
@@ -128,10 +131,10 @@ static void *monitor_thread(void *arg)
 
         if (rcvid == 0) {                              /* pulse */
             if (msg.pulse.code == PULSE_CODE_WATCHDOG) {
-                if (now_ns() - last_frame_ns > STALE_LIMIT_NS && state != ST_STALE) {
+                if (have_frame && now_ns() - last_frame_ns > STALE_LIMIT_NS && state != ST_STALE) {
                     state = ST_STALE;
-                    printf("[%8.3f s] SENSOR_STALE  no CAN frame for >30 ms -> fail-safe warning\n",
-                           now_ns() / 1e9);
+                    printf("[t=%6.2f s] SENSOR_STALE  no CAN frame for >30 ms -> fail-safe warning\n",
+                           last_t_s + (now_ns() - last_frame_ns) / 1e9);
                 }
             }
             continue;
@@ -143,6 +146,8 @@ static void *monitor_thread(void *arg)
         state_t next = decide(&msg.frame.f, &ttc);
         uint64_t done = ClockCycles();
         last_frame_ns = now_ns();
+        have_frame = 1;
+        last_t_s = msg.frame.f.t_s;
 
         frame_reply_t rep = { msg.frame.seq, next };
         MsgReply(rcvid, EOK, &rep, sizeof rep);
@@ -228,10 +233,11 @@ int main(int argc, char **argv)
 
     pthread_t mon, sen, load[16];
     if (nload > 16) nload = 16;
+    set_self_prio(PRIO_MAIN);
     pthread_create(&mon, NULL, monitor_thread, NULL);
-    for (int i = 0; i < nload; i++) pthread_create(&load[i], NULL, load_thread, NULL);
-    usleep(50000);
+    usleep(20000);
     pthread_create(&sen, NULL, sensor_thread, NULL);
+    for (int i = 0; i < nload; i++) pthread_create(&load[i], NULL, load_thread, NULL);
 
     pthread_join(sen, NULL);
     g_running = 0;
